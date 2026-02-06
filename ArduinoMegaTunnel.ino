@@ -16,6 +16,7 @@ bool blinkState = false;
 
 #define PIN_A 8
 #define PIN_B 9
+#define PIN_RELAY 7
 
 void setup() {
   Serial.begin(9600);
@@ -23,22 +24,23 @@ void setup() {
 
   pinMode(PIN_A, OUTPUT);
   pinMode(PIN_B, OUTPUT);
+  pinMode(PIN_RELAY, OUTPUT);
+
   digitalWrite(PIN_A, LOW);
   digitalWrite(PIN_B, LOW);
+  digitalWrite(PIN_RELAY, LOW);
 
   WiFi.init(&Serial1);
 
-  // ---------- ESP CHECK ----------
   if (WiFi.status() == WL_NO_SHIELD) {
     Serial.println("ESP NICHT GEFUNDEN!");
     esp_ok = false;
-    return;   // KEIN WIFI, loop macht nur Blinken
+    return;
   }
 
   esp_ok = true;
   Serial.println("ESP OK");
 
-  // ---------- WIFI ----------
   Serial.println("Verbinde WLAN...");
   WiFi.begin(ssid, pass);
 
@@ -61,19 +63,16 @@ void setup() {
 }
 
 void loop() {
-  // ===== FALLBACK: ESP TOT =====
   if (!esp_ok) {
     blinkError();
     return;
   }
 
-  // ===== REGISTRIERUNG =====
   if (wifi_ok && !registered && millis() - lastRegisterTry > 10000) {
     lastRegisterTry = millis();
     tryRegister();
   }
 
-  // ===== SERVER =====
   if (wifi_ok) {
     WiFiEspClient webClient = server.available();
     if (webClient) {
@@ -132,10 +131,23 @@ void handleRequest(WiFiEspClient &c) {
     req += ch;
   }
 
-  // ---- /api/tunnel ----
-  if (req.indexOf("GET /api/tunnel") != -1) {
+  // ---- /api/tunnelleds ----
+  if (req.indexOf("GET /api/tunnelleds") != -1) {
+    sendJson(c, 200, "{\"status\":\"ok\"}");
     blinkTransistors();
-    sendJson(c, 200, "{\"status\":\"tunnel triggered\"}");
+  }
+
+  // ---- /api/tunnel ----
+  else if (req.indexOf("GET /api/tunnel") != -1) {
+    sendJson(c, 200, "{\"status\":\"ok\"}");
+    tunnelSequence();
+  }
+
+  // ---- /api/nebel ----
+  else if (req.indexOf("GET /api/nebel") != -1) {
+    float duration = parseDuration(req);
+    sendJson(c, 200, "{\"status\":\"ok\"}");
+    triggerRelay(duration);
   }
 
   // ---- /api/checkconnection ----
@@ -155,7 +167,7 @@ void handleRequest(WiFiEspClient &c) {
   c.stop();
 }
 
-// ================= BLINK LOGIC =================
+// ================= LED EFFECT =================
 
 void blinkTransistors() {
   unsigned long start = millis();
@@ -172,6 +184,61 @@ void blinkTransistors() {
 
   digitalWrite(PIN_A, LOW);
   digitalWrite(PIN_B, LOW);
+}
+
+// ================= TUNNEL SEQUENCE =================
+
+void tunnelSequence() {
+  // Nebel an
+  digitalWrite(PIN_RELAY, HIGH);
+
+  // 1s warten
+  delay(1000);
+
+  // LEDs starten (5s)
+  unsigned long ledStart = millis();
+  bool fogOffDone = false;
+
+  while (millis() - ledStart < 5000) {
+    digitalWrite(PIN_A, HIGH);
+    digitalWrite(PIN_B, LOW);
+    delay(250);
+
+    digitalWrite(PIN_A, LOW);
+    digitalWrite(PIN_B, HIGH);
+    delay(250);
+
+    // nach insgesamt 2s Nebel aus
+    if (!fogOffDone && millis() - ledStart >= 1000) {
+      digitalWrite(PIN_RELAY, LOW);
+      fogOffDone = true;
+    }
+  }
+
+  digitalWrite(PIN_A, LOW);
+  digitalWrite(PIN_B, LOW);
+}
+
+// ================= NEBEL =================
+
+float parseDuration(String req) {
+  int idx = req.indexOf("duration=");
+  if (idx == -1) return 1.0;
+
+  String sub = req.substring(idx + 9);
+  int end = sub.indexOf(" ");
+  if (end != -1) sub = sub.substring(0, end);
+
+  sub.replace(",", ".");
+  return sub.toFloat();
+}
+
+void triggerRelay(float seconds) {
+  unsigned long ms = (unsigned long)(seconds * 1000);
+
+  digitalWrite(PIN_RELAY, HIGH);
+  delay(ms);
+  digitalWrite(PIN_RELAY, LOW);
 }
 
 // ================= UTILS =================
