@@ -1,7 +1,7 @@
 #include "WiFiEsp.h"
 
-char ssid[] = ".";
-char pass[] = "heheheha";
+char ssid[] = "Bamboo House 2,4 GHz";
+char pass[] = "59180773631938674181";
 
 WiFiEspClient client;
 WiFiEspServer server(80);
@@ -14,9 +14,24 @@ unsigned long lastRegisterTry = 0;
 unsigned long lastBlink = 0;
 bool blinkState = false;
 
+// Action flags for non-blocking execution
+bool doBlink = false;
+unsigned long doBlinkUntil = 0;
+bool doTunnel = false;
+unsigned long tunnelStartTime = 0;
+unsigned long tunnelEndTime = 0;
+bool tunnelRelayOffDone = false;
+bool doTriggerRelay = false;
+unsigned long triggerRelayUntil = 0;
+unsigned long lastActionBlink = 0;
+bool actionBlinkState = false;
+
 #define PIN_A 8
 #define PIN_B 9
 #define PIN_RELAY 7
+
+// dynamische IP des OrangePi, wird nur während Laufzeit gehalten
+String orangepiIP = "";
 
 void setup() {
   Serial.begin(9600);
@@ -68,9 +83,13 @@ void loop() {
     return;
   }
 
+  // execute background actions (non-blocking)
+  pollActions();
+
+  // Registrierung nur wenn WLAN OK und noch nicht registriert
   if (wifi_ok && !registered && millis() - lastRegisterTry > 10000) {
     lastRegisterTry = millis();
-    tryRegister();
+    findOrangePiAndRegister();
   }
 
   if (wifi_ok) {
@@ -82,7 +101,6 @@ void loop() {
 }
 
 // ================= ERROR BLINK =================
-
 void blinkError() {
   if (millis() - lastBlink > 1000) {
     lastBlink = millis();
@@ -91,63 +109,158 @@ void blinkError() {
   }
 }
 
-// ================= REGISTER =================
+// ================= FIND ORANGEPI =================
+void findOrangePiAndRegister() {
+  Serial.println("Suche OrangePi im Netzwerk...");
 
-void tryRegister() {
-  Serial.println("Versuche Registrierung...");
+  IPAddress localIP = WiFi.localIP();
+  byte subnet = localIP[2]; // z.B. 192.168.X.Y
+  byte base1 = localIP[0];
+  byte base2 = localIP[1];
 
-  if (client.connect("orangepi.local", 80)) {
-    client.println("GET /api/register/?device=Mega-Tunnel HTTP/1.1");
-    client.println("Host: orangepi.local");
+  for (int host = 180; host <= 254; host++) {
+    String testIP = String(base1) + "." + String(base2) + "." + String(subnet) + "." + String(host);
+
+    if (tryPingOrangePi(testIP)) {
+      orangepiIP = testIP;
+      Serial.print("OrangePi gefunden: ");
+      Serial.println(orangepiIP);
+
+      if (tryRegister()) {
+        Serial.println("REGISTRIERT!");
+      } else {
+        Serial.println("Registrierung fehlgeschlagen");
+      }
+      return;
+    }
+  }
+
+  Serial.println("OrangePi nicht gefunden.");
+}
+
+bool tryPingOrangePi(String ip) {
+  if (client.connect(ip.c_str(), 80)) {
+    client.println("GET /api/checkorangepi HTTP/1.1");
+    client.print("Host: ");
+    client.println(ip);
     client.println("Connection: close");
     client.println();
 
+    unsigned long timeout = millis() + 2000;
     String response = "";
-    while (client.connected()) {
+    // Read available data until timeout to handle servers that close connection early
+    while (millis() < timeout) {
       while (client.available()) {
         char c = client.read();
         response += c;
       }
+      // If connection closed and no more data, break early
+      if (!client.connected() && client.available() == 0) break;
+      delay(10);
     }
     client.stop();
 
-    if (response.indexOf("\"status\": \"ok\"") != -1) {
-      registered = true;
-      Serial.println("REGISTRIERT!");
-    } else {
-      Serial.println("Registrierung fehlgeschlagen");
+    // Debug: show response so you can inspect why detection failed
+    Serial.print("Ping response from ");
+    Serial.print(ip);
+    Serial.print(": ");
+    Serial.println(response);
+
+    // Accept common success indicators: HTTP 200, JSON status ok, or presence of the endpoint name
+    if (response.indexOf("200 OK") != -1 || response.indexOf("HTTP/1.1 200") != -1 || response.indexOf("\"status\": \"ok\"") != -1 || response.indexOf("checkorangepi") != -1) {
+      return true;
     }
-  } else {
-    Serial.println("OrangePi nicht erreichbar");
   }
+  return false;
+}
+
+// ================= REGISTER =================
+bool tryRegister() {
+  if (orangepiIP == "") return false;
+
+  // Try a couple times in case the OrangePi is slow to respond
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (client.connect(orangepiIP.c_str(), 80)) {
+      client.println("GET /api/register/?device=Mega-Tunnel HTTP/1.1");
+      client.print("Host: ");
+      client.println(orangepiIP);
+      client.println("Connection: close");
+      client.println();
+
+      unsigned long timeout = millis() + 2000;
+      String response = "";
+      while (millis() < timeout) {
+        while (client.available()) {
+          char c = client.read();
+          response += c;
+        }
+        if (!client.connected() && client.available() == 0) break;
+        delay(10);
+      }
+      client.stop();
+
+      Serial.print("Register response from ");
+      Serial.print(orangepiIP);
+      Serial.print(": ");
+      Serial.println(response);
+
+      if (response.indexOf("\"status\": \"ok\"") != -1 || response.indexOf("200 OK") != -1 || response.indexOf("200 ") != -1) {
+        registered = true;
+        return true;
+      }
+    }
+    delay(500);
+  }
+  return false;
 }
 
 // ================= SERVER =================
-
 void handleRequest(WiFiEspClient &c) {
   String req = "";
-  while (c.connected() && c.available()) {
-    char ch = c.read();
-    req += ch;
+  // Read request with small timeout and stop at end of headers
+  unsigned long start = millis();
+  while (c.connected() && millis() - start < 500) {
+    while (c.available()) {
+      char ch = c.read();
+      req += ch;
+      start = millis(); // reset timeout on incoming data
+      if (req.indexOf("\r\n\r\n") != -1) break;
+    }
+    if (req.indexOf("\r\n\r\n") != -1) break;
+    delay(1);
   }
 
   // ---- /api/tunnelleds ----
   if (req.indexOf("GET /api/tunnelleds") != -1) {
     sendJson(c, 200, "{\"status\":\"ok\"}");
-    blinkTransistors();
+    // start non-blocking blink for 5s
+    doBlink = true;
+    doBlinkUntil = millis() + 5000;
+    lastActionBlink = 0;
+    actionBlinkState = false;
   }
 
   // ---- /api/tunnel ----
   else if (req.indexOf("GET /api/tunnel") != -1) {
     sendJson(c, 200, "{\"status\":\"ok\"}");
-    tunnelSequence();
+    // start non-blocking tunnel sequence
+    doTunnel = true;
+    tunnelStartTime = millis();
+    tunnelEndTime = tunnelStartTime + 5000;
+    tunnelRelayOffDone = false;
+    digitalWrite(PIN_RELAY, HIGH);
+    lastActionBlink = 0;
+    actionBlinkState = false;
   }
 
   // ---- /api/nebel ----
   else if (req.indexOf("GET /api/nebel") != -1) {
     float duration = parseDuration(req);
     sendJson(c, 200, "{\"status\":\"ok\"}");
-    triggerRelay(duration);
+    // trigger relay non-blocking
+    doTriggerRelay = true;
+    triggerRelayUntil = millis() + (unsigned long)(duration * 1000);
+    digitalWrite(PIN_RELAY, HIGH);
   }
 
   // ---- /api/checkconnection ----
@@ -168,7 +281,6 @@ void handleRequest(WiFiEspClient &c) {
 }
 
 // ================= LED EFFECT =================
-
 void blinkTransistors() {
   unsigned long start = millis();
 
@@ -187,15 +299,10 @@ void blinkTransistors() {
 }
 
 // ================= TUNNEL SEQUENCE =================
-
 void tunnelSequence() {
-  // Nebel an
   digitalWrite(PIN_RELAY, HIGH);
-
-  // 1s warten
   delay(1000);
 
-  // LEDs starten (5s)
   unsigned long ledStart = millis();
   bool fogOffDone = false;
 
@@ -208,7 +315,6 @@ void tunnelSequence() {
     digitalWrite(PIN_B, HIGH);
     delay(250);
 
-    // nach insgesamt 2s Nebel aus
     if (!fogOffDone && millis() - ledStart >= 1000) {
       digitalWrite(PIN_RELAY, LOW);
       fogOffDone = true;
@@ -220,7 +326,6 @@ void tunnelSequence() {
 }
 
 // ================= NEBEL =================
-
 float parseDuration(String req) {
   int idx = req.indexOf("duration=");
   if (idx == -1) return 1.0;
@@ -241,8 +346,51 @@ void triggerRelay(float seconds) {
   digitalWrite(PIN_RELAY, LOW);
 }
 
-// ================= UTILS =================
+// ================= ACTION POLLING =================
+void pollActions() {
+  unsigned long now = millis();
 
+  // common blink for actions
+  if ((doBlink && now < doBlinkUntil) || (doTunnel && now < tunnelEndTime)) {
+    if (now - lastActionBlink >= 250) {
+      lastActionBlink = now;
+      actionBlinkState = !actionBlinkState;
+      if (actionBlinkState) {
+        digitalWrite(PIN_A, HIGH);
+        digitalWrite(PIN_B, LOW);
+      } else {
+        digitalWrite(PIN_A, LOW);
+        digitalWrite(PIN_B, HIGH);
+      }
+    }
+  } else {
+    // stop blinking when not needed
+    if (doBlink || doTunnel) {
+      digitalWrite(PIN_A, LOW);
+      digitalWrite(PIN_B, LOW);
+      actionBlinkState = false;
+    }
+    doBlink = false;
+    if (doTunnel && now >= tunnelEndTime) {
+      doTunnel = false;
+      tunnelRelayOffDone = false;
+    }
+  }
+
+  // tunnel relay off after 1s
+  if (doTunnel && !tunnelRelayOffDone && now - tunnelStartTime >= 1000) {
+    digitalWrite(PIN_RELAY, LOW);
+    tunnelRelayOffDone = true;
+  }
+
+  // trigger relay for fog
+  if (doTriggerRelay && now >= triggerRelayUntil) {
+    doTriggerRelay = false;
+    digitalWrite(PIN_RELAY, LOW);
+  }
+}
+
+// ================= UTILS =================
 void sendJson(WiFiEspClient &c, int code, const char* body) {
   c.print("HTTP/1.1 ");
   c.print(code);
@@ -250,6 +398,9 @@ void sendJson(WiFiEspClient &c, int code, const char* body) {
   else c.print(" ERROR\r\n");
 
   c.print("Content-Type: application/json\r\n");
+  c.print("Content-Length: ");
+  c.print(strlen(body));
+  c.print("\r\n");
   c.print("Connection: close\r\n\r\n");
   c.print(body);
 }
