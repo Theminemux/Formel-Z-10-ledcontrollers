@@ -118,7 +118,7 @@ void findOrangePiAndRegister() {
   byte base1 = localIP[0];
   byte base2 = localIP[1];
 
-  for (int host = 180; host <= 254; host++) {
+  for (int host = 1; host <= 254; host++) {
     String testIP = String(base1) + "." + String(base2) + "." + String(subnet) + "." + String(host);
 
     if (tryPingOrangePi(testIP)) {
