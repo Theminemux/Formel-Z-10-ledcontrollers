@@ -1,7 +1,7 @@
 #include "WiFiEsp.h"
 
-char ssid[] = "Bamboo House 2,4 GHz";
-char pass[] = "59180773631938674181";
+char ssid[] = "rescuerobotcar";
+char pass[] = "mint2025";
 
 WiFiEspClient client;
 WiFiEspServer server(80);
