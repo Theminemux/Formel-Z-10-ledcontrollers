@@ -6,32 +6,60 @@ char pass[] = "mint2025";
 WiFiEspClient client;
 WiFiEspServer server(80);
 
-bool esp_ok = false;
-bool wifi_ok = false;
-bool registered = false;
 
-unsigned long lastRegisterTry = 0;
-unsigned long lastBlink = 0;
-bool blinkState = false;
+// ================= CONFIG =================
+// Brücken-Parameter
+const float BRIDGE_DISTANCE_CM = 5.0;
+// Zeit (ms) die die Brücke zum Absenken braucht. 
+const unsigned long BRIDGE_DOWN_TIME_MS = 5000UL; 
 
-// Action flags for non-blocking execution
-bool doBlink = false;
-unsigned long doBlinkUntil = 0;
-bool doTunnel = false;
-unsigned long tunnelStartTime = 0;
-unsigned long tunnelEndTime = 0;
-bool tunnelRelayOffDone = false;
-bool doTriggerRelay = false;
-unsigned long triggerRelayUntil = 0;
-unsigned long lastActionBlink = 0;
-bool actionBlinkState = false;
-
+// Hardware-Pins (schnell editierbar)
+// Transistor-/LED-Ausgänge (Anzeige / Blink-LEDs)
 #define PIN_A 8
 #define PIN_B 9
+// Nebel-/Aktions-Relay
 #define PIN_RELAY 7
 
-// dynamische IP des OrangePi, wird nur während Laufzeit gehalten
+// Abstandssensor 
+#define PIN_DIST_TRIG 10
+#define PIN_DIST_ECHO 11
+
+// Motor an OUT1/OUT2 des L298N anschließen.
+#define PIN_MOTOR_IN1 22
+#define PIN_MOTOR_IN2 23
+// -------------------------------------------------------------------------
+
+// (Ende der Konfiguration)
+
+// ================= RUNTIME STATE & FLAGS =================
+// Laufzeitzustände und Flags (werden während Programmlauf verändert)
+// Aktueller Zustand der Brücke: true == oben
+bool bridgeIsUp = false;
+
+// Netzwerk-/Registrierungsstatus
+bool esp_ok = false;  
+bool wifi_ok = false;   
+bool registered = false;   
+
+// Timing / Blink-Status
+unsigned long lastRegisterTry = 0; 
+unsigned long lastBlink = 0;      
+bool blinkState = false;          
+
+// Action flags for non-blocking execution (beschreiben asynchrone Aktionen)
+bool doBlink = false;            
+unsigned long doBlinkUntil = 0;    
+bool doTunnel = false;          
+unsigned long tunnelStartTime = 0; 
+unsigned long tunnelEndTime = 0;   
+bool tunnelRelayOffDone = false;  
+bool doTriggerRelay = false;   
+unsigned long triggerRelayUntil = 0;
+unsigned long lastActionBlink = 0; 
+bool actionBlinkState = false;     
+
 String orangepiIP = "";
+
 
 void setup() {
   Serial.begin(9600);
@@ -41,9 +69,19 @@ void setup() {
   pinMode(PIN_B, OUTPUT);
   pinMode(PIN_RELAY, OUTPUT);
 
+  // Neue Pins initialisieren
+  pinMode(PIN_DIST_TRIG, OUTPUT);
+  pinMode(PIN_DIST_ECHO, INPUT);
+  pinMode(PIN_MOTOR_IN1, OUTPUT);
+  pinMode(PIN_MOTOR_IN2, OUTPUT);
+
   digitalWrite(PIN_A, LOW);
   digitalWrite(PIN_B, LOW);
   digitalWrite(PIN_RELAY, LOW);
+
+  digitalWrite(PIN_DIST_TRIG, LOW);
+  digitalWrite(PIN_MOTOR_IN1, LOW);
+  digitalWrite(PIN_MOTOR_IN2, LOW);
 
   WiFi.init(&Serial1);
 
@@ -75,6 +113,8 @@ void setup() {
     Serial.println("\nWLAN FEHLER");
     wifi_ok = false;
   }
+
+  calibrateBridgeOnStartup();
 }
 
 void loop() {
@@ -83,10 +123,8 @@ void loop() {
     return;
   }
 
-  // execute background actions (non-blocking)
   pollActions();
 
-  // Registrierung nur wenn WLAN OK und noch nicht registriert
   if (wifi_ok && !registered && millis() - lastRegisterTry > 10000) {
     lastRegisterTry = millis();
     findOrangePiAndRegister();
@@ -111,74 +149,22 @@ void blinkError() {
 
 // ================= FIND ORANGEPI =================
 void findOrangePiAndRegister() {
-  Serial.println("Suche OrangePi im Netzwerk...");
+  Serial.println("Verwende statische OrangePi-IP: 192.168.10.10");
+  orangepiIP = "192.168.10.10";
 
-  IPAddress localIP = WiFi.localIP();
-  byte subnet = localIP[2]; // z.B. 192.168.X.Y
-  byte base1 = localIP[0];
-  byte base2 = localIP[1];
-
-  for (int host = 1; host <= 254; host++) {
-    String testIP = String(base1) + "." + String(base2) + "." + String(subnet) + "." + String(host);
-
-    if (tryPingOrangePi(testIP)) {
-      orangepiIP = testIP;
-      Serial.print("OrangePi gefunden: ");
-      Serial.println(orangepiIP);
-
-      if (tryRegister()) {
-        Serial.println("REGISTRIERT!");
-      } else {
-        Serial.println("Registrierung fehlgeschlagen");
-      }
-      return;
-    }
+  if (tryRegister()) {
+    Serial.println("REGISTRIERT!");
+  } else {
+    Serial.println("Registrierung fehlgeschlagen");
   }
-
-  Serial.println("OrangePi nicht gefunden.");
 }
 
-bool tryPingOrangePi(String ip) {
-  if (client.connect(ip.c_str(), 80)) {
-    client.println("GET /api/checkorangepi HTTP/1.1");
-    client.print("Host: ");
-    client.println(ip);
-    client.println("Connection: close");
-    client.println();
-
-    unsigned long timeout = millis() + 2000;
-    String response = "";
-    // Read available data until timeout to handle servers that close connection early
-    while (millis() < timeout) {
-      while (client.available()) {
-        char c = client.read();
-        response += c;
-      }
-      // If connection closed and no more data, break early
-      if (!client.connected() && client.available() == 0) break;
-      delay(10);
-    }
-    client.stop();
-
-    // Debug: show response so you can inspect why detection failed
-    Serial.print("Ping response from ");
-    Serial.print(ip);
-    Serial.print(": ");
-    Serial.println(response);
-
-    // Accept common success indicators: HTTP 200, JSON status ok, or presence of the endpoint name
-    if (response.indexOf("200 OK") != -1 || response.indexOf("HTTP/1.1 200") != -1 || response.indexOf("\"status\": \"ok\"") != -1 || response.indexOf("checkorangepi") != -1) {
-      return true;
-    }
-  }
-  return false;
-}
 
 // ================= REGISTER =================
 bool tryRegister() {
   if (orangepiIP == "") return false;
 
-  // Try a couple times in case the OrangePi is slow to respond
+  // Try a couple times in case the OrangePi hasn't fully started yet
   for (int attempt = 0; attempt < 2; attempt++) {
     if (client.connect(orangepiIP.c_str(), 80)) {
       client.println("GET /api/register/?device=Mega-Tunnel HTTP/1.1");
@@ -251,6 +237,48 @@ void handleRequest(WiFiEspClient &c) {
     digitalWrite(PIN_RELAY, HIGH);
     lastActionBlink = 0;
     actionBlinkState = false;
+  }
+
+  // ---- /api/bridgeup ----
+  else if (req.indexOf("GET /api/bridgeup") != -1) {
+    if (bridgeIsUp) {
+      sendJson(c, 200, "{\"status\":\"ok\",\"bridge\":\"already_up\"}");
+    } else {
+      sendJson(c, 200, "{\"status\":\"ok\",\"action\":\"moving_up\"}");
+      unsigned long start = millis();
+      unsigned long timeout = start + BRIDGE_DOWN_TIME_MS + 5000UL;
+      motorBridgeUp();
+      while (millis() < timeout) {
+        float d = distanceReadCm();
+        if (d >= 0 && d <= BRIDGE_DISTANCE_CM) {
+          break;
+        }
+        delay(100);
+      }
+      motorBridgeStop();
+      float dfinal = distanceReadCm();
+      if (dfinal >= 0 && dfinal <= BRIDGE_DISTANCE_CM) {
+        bridgeIsUp = true;
+        Serial.println("Brücke: oben");
+      } else {
+        Serial.println("Brücke: Hochfahren fehlgeschlagen/Timeout");
+      }
+    }
+  }
+
+  // ---- /api/bridgedown ----
+  else if (req.indexOf("GET /api/bridgedown") != -1) {
+    if (!bridgeIsUp) {
+      sendJson(c, 200, "{\"status\":\"ok\",\"bridge\":\"already_down\"}");
+    } else {
+      // Antwort sofort senden, dann runterfahren für definierte Zeit
+      sendJson(c, 200, "{\"status\":\"ok\",\"action\":\"moving_down\"}");
+      motorBridgeDown();
+      delay(BRIDGE_DOWN_TIME_MS);
+      motorBridgeStop();
+      bridgeIsUp = false;
+      Serial.println("Brücke: unten");
+    }
   }
 
   // ---- /api/nebel ----
@@ -350,7 +378,6 @@ void triggerRelay(float seconds) {
 void pollActions() {
   unsigned long now = millis();
 
-  // common blink for actions
   if ((doBlink && now < doBlinkUntil) || (doTunnel && now < tunnelEndTime)) {
     if (now - lastActionBlink >= 250) {
       lastActionBlink = now;
@@ -364,7 +391,6 @@ void pollActions() {
       }
     }
   } else {
-    // stop blinking when not needed
     if (doBlink || doTunnel) {
       digitalWrite(PIN_A, LOW);
       digitalWrite(PIN_B, LOW);
@@ -403,4 +429,61 @@ void sendJson(WiFiEspClient &c, int code, const char* body) {
   c.print("\r\n");
   c.print("Connection: close\r\n\r\n");
   c.print(body);
+}
+
+// ================= MOTOR ("Brücke") =================
+void motorBridgeStop() {
+  digitalWrite(PIN_MOTOR_IN1, LOW);
+  digitalWrite(PIN_MOTOR_IN2, LOW);
+}
+
+void motorBridgeUp() {
+  digitalWrite(PIN_MOTOR_IN1, HIGH);
+  digitalWrite(PIN_MOTOR_IN2, LOW);
+}
+
+void motorBridgeDown() {
+  digitalWrite(PIN_MOTOR_IN1, LOW);
+  digitalWrite(PIN_MOTOR_IN2, HIGH);
+}
+
+// ================= DISTANZMESSER =================
+float distanceReadCm() {
+  unsigned long duration;
+
+  digitalWrite(PIN_DIST_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_DIST_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_DIST_TRIG, LOW);
+
+  duration = pulseIn(PIN_DIST_ECHO, HIGH, 30000UL);
+  if (duration == 0) return -1.0; // kein Echo / außerhalb Reichweite
+
+  // Umrechnung: Abstand(cm) = Dauer(us) / 58
+  float dist = (float)duration / 58.0;
+  return dist;
+}
+
+// ================= BRIDGE CALIBRATION & HELPERS =================
+void calibrateBridgeOnStartup() {
+  Serial.println("Kalibriere Brücke...");
+  unsigned long start = millis();
+  unsigned long timeout = start + BRIDGE_DOWN_TIME_MS + 5000UL;
+
+  // fahre hoch und warte auf den Abstandswert
+  motorBridgeUp();
+  while (millis() < timeout) {
+    float d = distanceReadCm();
+    if (d >= 0 && d <= BRIDGE_DISTANCE_CM) {
+      motorBridgeStop();
+      bridgeIsUp = true;
+      Serial.println("Brücke kalibriert: oben");
+      return;
+    }
+    delay(100);
+  }
+  motorBridgeStop();
+  bridgeIsUp = false;
+  Serial.println("Kalibrierung fehlgeschlagen: Timeout");
 }
