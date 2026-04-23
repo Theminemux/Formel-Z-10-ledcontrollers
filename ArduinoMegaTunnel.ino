@@ -250,7 +250,7 @@ void handleRequest(WiFiEspClient &c) {
       motorBridgeUp();
       while (millis() < timeout) {
         float d = distanceReadCm();
-        if (d >= 0 && d <= BRIDGE_DISTANCE_CM) {
+        if (d >= 0 && d >= BRIDGE_DISTANCE_CM) {
           break;
         }
         delay(100);
