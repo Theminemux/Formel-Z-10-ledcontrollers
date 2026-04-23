@@ -21,12 +21,12 @@ const unsigned long BRIDGE_DOWN_TIME_MS = 5000UL;
 #define PIN_RELAY 7
 
 // Abstandssensor 
-#define PIN_DIST_TRIG 10
-#define PIN_DIST_ECHO 11
+#define PIN_DIST_TRIG 50
+#define PIN_DIST_ECHO 51
 
 // Motor an OUT1/OUT2 des L298N anschließen.
-#define PIN_MOTOR_IN1 22
-#define PIN_MOTOR_IN2 23
+#define PIN_MOTOR_IN1 52
+#define PIN_MOTOR_IN2 53
 // -------------------------------------------------------------------------
 
 // (Ende der Konfiguration)
