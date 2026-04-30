@@ -9,7 +9,7 @@ WiFiEspServer server(80);
 
 // ================= CONFIG =================
 // Brücken-Parameter
-const float BRIDGE_DISTANCE_CM = 5.0;
+const float BRIDGE_DISTANCE_CM = 24.0;
 // Zeit (ms) die die Brücke zum Absenken braucht. 
 const unsigned long BRIDGE_DOWN_TIME_MS = 5000UL; 
 
